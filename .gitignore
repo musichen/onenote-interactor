@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+cli/node_modules/
+
+# Lock files (pnpm is the enforced package manager)
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+
+# Environment & secrets
+.env.local
+.env.*.local
+.env.development
+.env.production
+*.pem
+*.key
+*.p12
+*.pfx
+*.cert
+*.crt
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Exported user data (OneNote notebooks, personal content)
+exports/
+logs/
+tmp/
+*.log
+
+# Runtime / cache files
+.stats-server.pid
+.stats-server.log
+.cache/
+*.cache
+
+# Build outputs
+dist/
+build/
+out/
+coverage/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test artifacts (keep tests, ignore generated outputs)
+test-results/
+*.test-output
+
+# Development docs with personal data (notebook IDs, emails, conversation history)
+docs/
+
+# Markdown-only book exports (generated on demand)
+exports-markdown/

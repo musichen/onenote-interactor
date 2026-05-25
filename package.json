@@ -1,0 +1,34 @@
+{
+  "name": "onenote-interactor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local and Microsoft Graph helpers for exploring and exporting OneNote notebooks.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/**/*.test.js",
+    "auth:login": "node src/onenote-interactor.js graph-login",
+    "graph:count": "node src/onenote-interactor.js graph-count --notebook A --out exports/graph/A/count-summary.json",
+    "local:index": "node src/onenote-interactor.js local-index --notebook A --out exports/local-index-A.json",
+    "local:preview": "node src/onenote-interactor.js local-preview",
+    "graph:list": "node src/onenote-interactor.js graph-list --notebook A",
+    "graph:export": "node src/onenote-interactor.js graph-export --notebook A --out exports/graph/A",
+    "graph:manifest": "node src/onenote-interactor.js graph-manifest --root exports/graph/A",
+    "graph:diff": "node src/onenote-interactor.js graph-diff --notebook A --root exports/graph/A",
+    "graph:resync": "node src/onenote-interactor.js graph-resync --notebook A --root exports/graph/A",
+    "graph:postprocess": "node src/onenote-interactor.js graph-postprocess --root exports/graph/A",
+    "graph:status": "node src/onenote-interactor.js graph-status --root exports/graph/A",
+    "graph:audit": "node src/onenote-interactor.js graph-audit --root exports/graph/A",
+    "graph:sync": "node src/onenote-interactor.js graph-sync --notebook A --out exports/graph/A",
+    "stats:server": "node src/stats-server.js --root exports/graph/A --port 9876",
+    "stats:server:silent": "node scripts/stats-server-manager.cjs start",
+    "stats:server:status": "node scripts/stats-server-manager.cjs status",
+    "stats:server:stop": "node scripts/stats-server-manager.cjs stop",
+    "cli": "./cli/bin/onenote-interactor"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^3.8.0",
+    "jsdom": "^29.1.1",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}
