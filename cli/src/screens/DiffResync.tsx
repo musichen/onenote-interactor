@@ -93,7 +93,7 @@ export function DiffResync({ notebook, onBack }: DiffResyncProps) {
     return (
       <Box flexDirection="column">
         <Text bold>Diff & Resync — {notebook}</Text>
-        <Text color="gray">Quick = time-filtered scan (~30-60s). Full = scans all pages (~10-15min).</Text>
+        <Text color="gray">Quick = reuses cached structure, time-filtered (~30-60s). Full = refreshes structure from Graph, scans every page (~10-15min).</Text>
         <Box marginTop={1}>
           <SelectInput
             items={items}
@@ -121,7 +121,10 @@ export function DiffResync({ notebook, onBack }: DiffResyncProps) {
       "--root",
       `exports/graph/${notebook}`,
     ];
-    if (mode?.full) args.push("--full");
+    if (mode?.full) {
+      args.push("--full");
+      args.push("--refresh-structure");
+    }
     return (
       <Box flexDirection="column">
         <CommandRunner
@@ -144,15 +147,20 @@ export function DiffResync({ notebook, onBack }: DiffResyncProps) {
       "--root",
       `exports/graph/${notebook}`,
     ];
-    if (!forceFresh) args.push("--use-diff");
-    if (mode?.full) args.push("--full");
+    if (mode?.full) {
+      args.push("--full");
+      args.push("--refresh-structure");
+      // Full resync always computes a fresh diff — never reuse stale ones
+    } else if (!forceFresh) {
+      args.push("--use-diff");
+    }
     return (
       <Box flexDirection="column">
         <CommandRunner
           cmd="node"
           args={args}
           cwd={ROOT_DIR}
-          label={`Running ${mode?.full ? "full" : "quick"} resync on ${notebook}${forceFresh ? " (fresh scan)" : ""}...`}
+          label={`Running ${mode?.full ? "full" : "quick"} resync on ${notebook}${forceFresh || mode?.full ? " (fresh scan)" : ""}...`}
           onComplete={handleComplete}
         />
       </Box>

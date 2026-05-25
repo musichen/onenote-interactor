@@ -1601,6 +1601,7 @@ async function scanRemotePages(token, structure, options = {}) {
   const failedSections = [];
   const isQuick = !!options.cutoffTimestamp;
 
+  let scannedSections = 0;
   for (const section of sections) {
     await activeTracker?.setPhase("scan-section");
     await activeTracker?.setCurrentSection(section.path);
@@ -1636,6 +1637,7 @@ async function scanRemotePages(token, structure, options = {}) {
           page
         };
       }
+      scannedSections += 1;
       console.log(`Scanned ${sectionPages.length} pages: ${section.path}${isQuick ? " (quick)" : ""}`);
     } catch (error) {
       if (error.message.includes("403 Forbidden")) {
@@ -1648,6 +1650,7 @@ async function scanRemotePages(token, structure, options = {}) {
     }
   }
 
+  console.log(`Scan complete: ${Object.keys(pages).length} total pages from ${scannedSections}/${sections.length} sections (${protectedSections.length} protected, ${failedSections.length} failed)`);
   return { pages, protectedSections, failedSections, isQuick };
 }
 
@@ -1820,9 +1823,11 @@ async function diffGraphNotebook(options) {
   const unchanged = [];
   const deleted = [];
 
+  const verbose = options.verbose === true;
   for (const remotePage of Object.values(remote.pages)) {
     const localPage = manifest.pages[remotePage.id];
     if (!localPage) {
+      if (verbose) console.log(`  ADDED: ${remotePage.sectionPath}/${remotePage.title}`);
       added.push(remotePage);
       continue;
     }
@@ -1830,6 +1835,7 @@ async function diffGraphNotebook(options) {
     const localHtmlPath = path.join(rootDir, localPage.htmlPath || "");
     const localJsonPath = path.join(rootDir, localPage.jsonPath || "");
     if (!(await pathExists(localHtmlPath)) || !(await pathExists(localJsonPath))) {
+      if (verbose) console.log(`  MISSING: ${remotePage.sectionPath}/${remotePage.title}`);
       missingLocal.push(remotePage);
       continue;
     }
@@ -1839,6 +1845,12 @@ async function diffGraphNotebook(options) {
       localPage.lastModifiedDateTime &&
       new Date(remotePage.lastModifiedDateTime) > new Date(localPage.lastModifiedDateTime)
     ) {
+      if (verbose) {
+        console.log(
+          `  UPDATED: ${remotePage.sectionPath}/${remotePage.title} ` +
+          `(local: ${localPage.lastModifiedDateTime} → remote: ${remotePage.lastModifiedDateTime})`
+        );
+      }
       updated.push({
         ...remotePage,
         previousLastModifiedDateTime: localPage.lastModifiedDateTime
@@ -1846,6 +1858,12 @@ async function diffGraphNotebook(options) {
       continue;
     }
 
+    if (verbose && remotePage.lastModifiedDateTime && localPage.lastModifiedDateTime) {
+      console.log(
+        `  unchanged: ${remotePage.sectionPath}/${remotePage.title} ` +
+        `(local: ${localPage.lastModifiedDateTime}, remote: ${remotePage.lastModifiedDateTime})`
+      );
+    }
     unchanged.push(remotePage);
   }
 
@@ -1888,6 +1906,17 @@ async function diffGraphNotebook(options) {
   await writeDiffLogMarkdown(summary, rootDir);
   console.log(`Wrote diff summary to ${outPath}`);
   console.log(JSON.stringify(summary.totals, null, 2));
+
+  if (summary.totals.added === 0 && summary.totals.updated === 0 && summary.totals.deleted === 0 && summary.totals.missingLocal === 0) {
+    console.log("");
+    console.log("⚠️  No changes detected. Possible reasons:");
+    console.log("   • OneNote changes haven't synced to Microsoft Graph yet (can take a few minutes)");
+    console.log("   • The modified page's timestamp hasn't updated in Graph API");
+    console.log("   • Pages were added to a new section that wasn't discovered (try --refresh-structure)");
+    console.log("   • The local manifest is missing or out of date (run graph-manifest first)");
+    console.log("");
+  }
+
   return summary;
 }
 
