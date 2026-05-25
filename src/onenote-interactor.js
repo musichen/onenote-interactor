@@ -1824,6 +1824,7 @@ async function diffGraphNotebook(options) {
   const deleted = [];
 
   const verbose = options.verbose === true;
+  const suspicious = [];
   for (const remotePage of Object.values(remote.pages)) {
     const localPage = manifest.pages[remotePage.id];
     if (!localPage) {
@@ -1840,11 +1841,10 @@ async function diffGraphNotebook(options) {
       continue;
     }
 
-    if (
-      remotePage.lastModifiedDateTime &&
-      localPage.lastModifiedDateTime &&
-      new Date(remotePage.lastModifiedDateTime) > new Date(localPage.lastModifiedDateTime)
-    ) {
+    const remoteTime = remotePage.lastModifiedDateTime ? new Date(remotePage.lastModifiedDateTime).getTime() : 0;
+    const localTime = localPage.lastModifiedDateTime ? new Date(localPage.lastModifiedDateTime).getTime() : 0;
+
+    if (remoteTime > localTime) {
       if (verbose) {
         console.log(
           `  UPDATED: ${remotePage.sectionPath}/${remotePage.title} ` +
@@ -1858,13 +1858,40 @@ async function diffGraphNotebook(options) {
       continue;
     }
 
-    if (verbose && remotePage.lastModifiedDateTime && localPage.lastModifiedDateTime) {
+    if (localTime > remoteTime) {
+      // Manifest claims page is newer than Graph — suspicious, usually means
+      // Graph hasn't synced the latest changes yet, OR the manifest was
+      // updated with a future timestamp somehow.
+      suspicious.push({
+        ...remotePage,
+        localLastModifiedDateTime: localPage.lastModifiedDateTime,
+        reason: "manifest newer than Graph"
+      });
+      if (verbose) {
+        console.log(
+          `  SUSPICIOUS: ${remotePage.sectionPath}/${remotePage.title} ` +
+          `(local: ${localPage.lastModifiedDateTime} > remote: ${remotePage.lastModifiedDateTime})`
+        );
+      }
+    } else if (verbose) {
       console.log(
         `  unchanged: ${remotePage.sectionPath}/${remotePage.title} ` +
         `(local: ${localPage.lastModifiedDateTime}, remote: ${remotePage.lastModifiedDateTime})`
       );
     }
     unchanged.push(remotePage);
+  }
+
+  if (suspicious.length > 0) {
+    console.log("");
+    console.log(`⚠️  ${suspicious.length} page(s) have manifest timestamps newer than Graph (possible sync lag):`);
+    for (const p of suspicious.slice(0, 20)) {
+      console.log(`   • ${p.sectionPath}/${p.title} (local: ${p.localLastModifiedDateTime}, remote: ${p.lastModifiedDateTime})`);
+    }
+    if (suspicious.length > 20) {
+      console.log(`   ... and ${suspicious.length - 20} more`);
+    }
+    console.log("");
   }
 
   // In quick mode we cannot detect deletions because we didn't scan all pages.
@@ -2111,6 +2138,24 @@ async function resyncGraphNotebook(options) {
   }
   const manifest = await loadLocalManifest(rootDir);
   const toExport = [...diff.added, ...diff.updated, ...diff.missingLocal];
+  const forceTitles = (options["force-titles"] || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (forceTitles.length > 0) {
+    // Also scan unchanged pages — force-export any whose title matches,
+    // bypassing timestamp comparison (useful when Graph sync lag hides edits).
+    for (const remotePage of diff.unchanged || []) {
+      const titleLower = (remotePage.title || "").toLowerCase();
+      const matches = forceTitles.some((pattern) => titleLower.includes(pattern));
+      if (matches && !toExport.find((p) => p.id === remotePage.id)) {
+        console.log(`Force export (title match): ${remotePage.sectionPath}/${remotePage.title}`);
+        toExport.push(remotePage);
+      }
+    }
+  }
+
   const stats = {
     pagesExported: 0,
     pagesFailed: 0,
