@@ -2610,6 +2610,266 @@ async function graphSync(options) {
   await postprocessGraphExport({ root: outDir });
 }
 
+async function generateHtmlViewer(options) {
+  const rootDir = options.root || path.join(process.cwd(), "exports", "graph", "A");
+  const structure = await readJsonIfExists(path.join(rootDir, "structure.json"));
+  const manifest = await loadLocalManifest(rootDir);
+
+  if (!structure) {
+    throw new Error(`No structure.json found in ${rootDir}. Run graph-export first.`);
+  }
+
+  // Build flat list of pages with their file paths from manifest
+  const pages = Object.values(manifest.pages || {})
+    .filter((p) => p.htmlPath)
+    .map((p) => ({
+      id: p.id,
+      title: p.title || "Untitled",
+      sectionPath: p.sectionPath || "",
+      htmlPath: p.htmlPath
+    }));
+
+  const notebookName = structure.name || "Notebook";
+
+  const viewerHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(notebookName)} — OneNote Viewer</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100vh; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #layout { display: flex; height: 100vh; }
+  #sidebar { width: 300px; min-width: 200px; max-width: 450px; background: #faf9f8; border-right: 1px solid #e1dfdd; display: flex; flex-direction: column; resize: horizontal; overflow: auto; }
+  #sidebar-header { padding: 12px 16px; border-bottom: 1px solid #e1dfdd; background: #f3f2f1; }
+  #sidebar-header h2 { margin: 0 0 8px 0; font-size: 14px; font-weight: 600; color: #323130; }
+  #search { width: 100%; padding: 6px 10px; border: 1px solid #8a8886; border-radius: 4px; font-size: 13px; }
+  #search:focus { outline: none; border-color: #0078d4; }
+  #tree { flex: 1; overflow-y: auto; padding: 8px 0; font-size: 13px; }
+  .group { margin-bottom: 2px; }
+  .group-header, .section-header, .page-item { padding: 5px 16px; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+  .group-header:hover, .section-header:hover, .page-item:hover { background: #edebe9; }
+  .group-header { font-weight: 600; color: #323130; }
+  .section-header { padding-left: 28px; color: #605e5c; font-weight: 500; }
+  .page-item { padding-left: 40px; color: #323130; text-decoration: none; }
+  .page-item.active { background: #0078d4; color: #fff; }
+  .page-item.active:hover { background: #106ebe; }
+  .toggle { display: inline-block; width: 14px; text-align: center; font-size: 10px; color: #605e5c; transition: transform 0.15s; }
+  .toggle.collapsed { transform: rotate(-90deg); }
+  .children { overflow: hidden; transition: max-height 0.2s ease; }
+  .children.collapsed { max-height: 0; }
+  .page-count { margin-left: auto; font-size: 11px; color: #a19f9d; font-weight: 400; }
+  .active .page-count { color: rgba(255,255,255,0.8); }
+  #content { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #breadcrumbs { padding: 8px 16px; background: #f3f2f1; border-bottom: 1px solid #e1dfdd; font-size: 12px; color: #605e5c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #breadcrumbs span { color: #0078d4; cursor: pointer; }
+  #breadcrumbs span:hover { text-decoration: underline; }
+  iframe { flex: 1; border: none; width: 100%; background: #fff; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="layout">
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <h2>${escapeHtml(notebookName)}</h2>
+      <input type="text" id="search" placeholder="Search pages...">
+    </div>
+    <div id="tree"></div>
+  </div>
+  <div id="content">
+    <div id="breadcrumbs">Select a page from the sidebar</div>
+    <iframe id="frame" src="about:blank"></iframe>
+  </div>
+</div>
+<script>
+const NOTEBOOK = ${JSON.stringify(notebookName)};
+const STRUCTURE = ${JSON.stringify(structure)};
+const PAGES = ${JSON.stringify(pages)};
+
+function buildTree() {
+  const tree = document.getElementById('tree');
+  const flatSections = [];
+
+  // Flatten structure sections with their paths
+  (STRUCTURE.sections || []).forEach(s => flatSections.push({ ...s, path: s.name, depth: 0 }));
+  function walkGroup(group, prefix) {
+    const gp = [...prefix, group.name];
+    (group.sections || []).forEach(s => flatSections.push({ ...s, path: gp.concat(s.name).join('/'), depth: gp.length }));
+    (group.sectionGroups || []).forEach(g => walkGroup(g, gp));
+  }
+  (STRUCTURE.sectionGroups || []).forEach(g => walkGroup(g, []));
+
+  // Attach pages to sections
+  const sectionPages = new Map();
+  PAGES.forEach(p => {
+    const list = sectionPages.get(p.sectionPath) || [];
+    list.push(p);
+    sectionPages.set(p.sectionPath, list);
+  });
+
+  // Build DOM
+  const container = document.createElement('div');
+
+  // Top-level sections
+  (STRUCTURE.sections || []).forEach(sec => {
+    const pages = sectionPages.get(sec.name) || [];
+    container.appendChild(createSection(sec.name, sec.name, pages, 0));
+  });
+
+  // Section groups
+  (STRUCTURE.sectionGroups || []).forEach(g => {
+    container.appendChild(createGroup(g, [], sectionPages));
+  });
+
+  tree.innerHTML = '';
+  tree.appendChild(container);
+}
+
+function createGroup(group, prefix, sectionPages) {
+  const gp = [...prefix, group.name];
+  const el = document.createElement('div');
+  el.className = 'group';
+
+  const header = document.createElement('div');
+  header.className = 'group-header';
+  const toggle = document.createElement('span');
+  toggle.className = 'toggle';
+  toggle.textContent = '▼';
+  header.appendChild(toggle);
+  header.appendChild(document.createTextNode(group.name));
+  el.appendChild(header);
+
+  const children = document.createElement('div');
+  children.className = 'children';
+
+  let totalPages = 0;
+  (group.sections || []).forEach(s => {
+    const pages = sectionPages.get(gp.concat(s.name).join('/')) || [];
+    totalPages += pages.length;
+    children.appendChild(createSection(s.name, gp.concat(s.name).join('/'), pages, gp.length));
+  });
+  (group.sectionGroups || []).forEach(g => {
+    const childGroup = createGroup(g, gp, sectionPages);
+    children.appendChild(childGroup);
+    totalPages += parseInt(childGroup.dataset.pageCount || 0);
+  });
+
+  el.dataset.pageCount = totalPages;
+  const countBadge = document.createElement('span');
+  countBadge.className = 'page-count';
+  countBadge.textContent = totalPages;
+  header.appendChild(countBadge);
+
+  el.appendChild(children);
+
+  header.addEventListener('click', () => {
+    children.classList.toggle('collapsed');
+    toggle.classList.toggle('collapsed');
+  });
+
+  return el;
+}
+
+function createSection(name, path, pages, depth) {
+  const el = document.createElement('div');
+  el.className = 'group';
+
+  const header = document.createElement('div');
+  header.className = 'section-header';
+  const toggle = document.createElement('span');
+  toggle.className = 'toggle';
+  toggle.textContent = pages.length > 0 ? '▼' : '';
+  header.appendChild(toggle);
+  header.appendChild(document.createTextNode(name));
+  el.appendChild(header);
+
+  const children = document.createElement('div');
+  children.className = 'children';
+
+  pages.sort((a, b) => a.title.localeCompare(b.title));
+  pages.forEach(p => {
+    const pageEl = document.createElement('a');
+    pageEl.className = 'page-item';
+    pageEl.href = '#';
+    pageEl.textContent = p.title;
+    pageEl.dataset.path = p.sectionPath;
+    pageEl.dataset.html = p.htmlPath;
+    pageEl.dataset.title = p.title;
+    pageEl.addEventListener('click', (e) => {
+      e.preventDefault();
+      loadPage(p);
+    });
+    children.appendChild(pageEl);
+  });
+
+  el.appendChild(children);
+
+  header.addEventListener('click', () => {
+    if (pages.length === 0) return;
+    children.classList.toggle('collapsed');
+    toggle.classList.toggle('collapsed');
+  });
+
+  return el;
+}
+
+function loadPage(page) {
+  document.getElementById('frame').src = page.htmlPath;
+  document.getElementById('breadcrumbs').innerHTML = escapeHtml(page.sectionPath) + ' / <span>' + escapeHtml(page.title) + '</span>';
+  document.querySelectorAll('.page-item.active').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.page-item').forEach(el => {
+    if (el.dataset.html === page.htmlPath) el.classList.add('active');
+  });
+  // Update URL hash for shareability
+  history.replaceState(null, '', '#' + encodeURIComponent(page.htmlPath));
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Search
+let searchDebounce;
+document.getElementById('search').addEventListener('input', (e) => {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => filterTree(e.target.value), 150);
+});
+
+function filterTree(query) {
+  const q = query.trim().toLowerCase();
+  document.querySelectorAll('.page-item').forEach(el => {
+    const match = !q || el.dataset.title.toLowerCase().includes(q);
+    el.classList.toggle('hidden', !match);
+  });
+  document.querySelectorAll('.group').forEach(g => {
+    const hasVisible = g.querySelector('.page-item:not(.hidden)') !== null;
+    g.classList.toggle('hidden', !hasVisible && q.length > 0);
+  });
+}
+
+// Handle hash on load
+window.addEventListener('DOMContentLoaded', () => {
+  buildTree();
+  if (location.hash) {
+    const htmlPath = decodeURIComponent(location.hash.slice(1));
+    const page = PAGES.find(p => p.htmlPath === htmlPath);
+    if (page) loadPage(page);
+  }
+});
+</script>
+</body>
+</html>`;
+
+  const viewerPath = path.join(rootDir, "viewer.html");
+  await fs.writeFile(viewerPath, viewerHtml, "utf8");
+  console.log(`Generated viewer: ${viewerPath}`);
+  console.log(`Open it in a browser: file://${viewerPath}`);
+}
+
 function printHelp() {
   console.log(`Usage:
   node src/onenote-interactor.js graph-login
@@ -2630,6 +2890,7 @@ function printHelp() {
   node src/onenote-interactor.js graph-status [--root DIR]
   node src/onenote-interactor.js graph-audit [--root DIR] [--out FILE]
   node src/onenote-interactor.js graph-sync [--notebook A] [--out DIR]
+  node src/onenote-interactor.js graph-viewer [--root DIR]
 `);
 }
 
@@ -2706,6 +2967,9 @@ async function main() {
       break;
     case "graph-sync":
       await graphSync(options);
+      break;
+    case "graph-viewer":
+      await generateHtmlViewer(options);
       break;
     case "--help":
     case "-h":
