@@ -2610,6 +2610,15 @@ async function graphSync(options) {
   await postprocessGraphExport({ root: outDir });
 }
 
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 async function generateHtmlViewer(options) {
   const rootDir = options.root || path.join(process.cwd(), "exports", "graph", "A");
   const structure = await readJsonIfExists(path.join(rootDir, "structure.json"));
