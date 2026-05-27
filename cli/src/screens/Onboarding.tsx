@@ -96,7 +96,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
             value={clientId}
             onChange={setClientId}
             onSubmit={() => setStep("confirm")}
-            placeholder="cd86f4e7-9e5d-4756-937a-081ab93099f0"
+            placeholder="00000000-0000-0000-0000-000000000000"
           />
         </Box>
         <Text color="gray" dimColor>

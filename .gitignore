@@ -58,3 +58,18 @@ docs/
 
 # Markdown-only book exports (generated on demand)
 exports-markdown/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Lint/format caches
+.eslintcache
+.prettiercache
+
+# Catch-all local files
+*.local
+
+# CI / deployment
+.vercel/
+.netlify/
+.turbo/

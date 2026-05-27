@@ -5,6 +5,9 @@ import path from "node:path";
 import os from "node:os";
 import {
   diffGraphNotebook,
+  graphStatus,
+  setAccessTokenProvider,
+  resetAccessTokenProvider,
   scanRemotePages,
   graphFetchAllJsonItems,
   graphFetchJson,
@@ -159,8 +162,70 @@ describe("scanRemotePages", () => {
 describe("diffGraphNotebook", () => {
   // These tests require mocking the MSAL auth flow (getAccessToken).
   // For now we test diff logic indirectly via scanRemotePages tests above.
-  // TODO: add getAccessToken to exports and mock it for full integration tests.
-  it("placeholder — diff logic is covered by scanRemotePages tests", () => {
-    assert.ok(true);
+  beforeEach(() => {
+    setAccessTokenProvider(async () => "fake-token");
+  });
+
+  afterEach(() => {
+    resetAccessTokenProvider();
+    global.fetch = undefined;
+  });
+
+  it("detects moved pages and reports previous section path", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "onenote-diff-test-"));
+    try {
+      const notebook = { id: "notebook-1", displayName: "A" };
+      const structure = {
+        sections: [
+          { name: "NewSec", id: "sec-1", type: "section" }
+        ],
+        sectionGroups: []
+      };
+      await fs.mkdir(path.join(tmpDir, "pages", "OldSec"), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, "pages", "OldSec", "moved-page-1.html"), "<html></html>");
+      await fs.writeFile(path.join(tmpDir, "pages", "OldSec", "moved-page-1.json"), JSON.stringify({ id: "page-1", title: "Moved Page", createdDateTime: "2024-01-10T08:00:00Z", lastModifiedDateTime: "2024-01-10T08:00:00Z" }));
+      await fs.writeFile(path.join(tmpDir, "notebook.json"), JSON.stringify(notebook));
+      await fs.writeFile(path.join(tmpDir, "structure.json"), JSON.stringify(structure));
+      await fs.writeFile(path.join(tmpDir, "pages-manifest.json"), JSON.stringify({
+        generatedAt: new Date().toISOString(),
+        rootDir: tmpDir,
+        pages: {
+          "page-1": {
+            id: "page-1",
+            title: "Moved Page",
+            sectionPath: "OldSec",
+            htmlPath: path.join("pages", "OldSec", "moved-page-1.html"),
+            jsonPath: path.join("pages", "OldSec", "moved-page-1.json"),
+            createdDateTime: "2024-01-10T08:00:00Z",
+            lastModifiedDateTime: "2024-01-10T08:00:00Z"
+          }
+        }
+      }));
+
+      global.fetch = async (url) => {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => ({
+            value: [
+              {
+                id: "page-1",
+                title: "Moved Page",
+                lastModifiedDateTime: "2024-01-20T08:00:00Z",
+                createdDateTime: "2024-01-10T08:00:00Z"
+              }
+            ]
+          })
+        };
+      };
+
+      const summary = await diffGraphNotebook({ notebook: "A", root: tmpDir, full: true });
+      assert.strictEqual(summary.totals.moved, 1);
+      assert.strictEqual(summary.moved[0].previousSectionPath, "OldSec");
+      assert.strictEqual(summary.moved[0].sectionPath, "NewSec");
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });

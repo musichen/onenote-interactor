@@ -28,12 +28,32 @@ const DEFAULT_GRAPH_RETRY_COUNT = 8;
 const DEFAULT_GRAPH_RESOURCE_RETRY_COUNT = 8;
 const DEFAULT_GRAPH_BASE_DELAY_MS = 1500;
 const DEFAULT_GRAPH_MAX_DELAY_MS = 120000;
-const DEFAULT_GRAPH_MIN_INTERVAL_MS = 1000;
+const DEFAULT_GRAPH_MIN_INTERVAL_MS = 200;
+const DEFAULT_GRAPH_CONCURRENCY = 3;
 const DEFAULT_GRAPH_TIMEOUT_MS = 45000;
 const DEFAULT_GRAPH_RESOURCE_TIMEOUT_MS = 30000;
 const DEFAULT_PROGRESS_INTERVAL_MS = 15000;
 let lastGraphRequestAt = 0;
+let graphActiveRequests = 0;
+const graphRequestQueue = [];
 let activeTracker = null;
+
+async function acquireGraphRequestSlot() {
+  if (graphActiveRequests < DEFAULT_GRAPH_CONCURRENCY) {
+    graphActiveRequests += 1;
+    return;
+  }
+  await new Promise((resolve) => graphRequestQueue.push(resolve));
+  graphActiveRequests += 1;
+}
+
+function releaseGraphRequestSlot() {
+  graphActiveRequests = Math.max(0, graphActiveRequests - 1);
+  const next = graphRequestQueue.shift();
+  if (next) {
+    next();
+  }
+}
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
@@ -265,8 +285,9 @@ async function saveTokenCache(pca) {
   await ensureDir(DEFAULT_CACHE_DIR);
   await fs.writeFile(DEFAULT_CACHE_PATH, await tokenCache.serialize());
 }
+let accessTokenProvider = null;
 
-async function getAccessToken(scopes = DEFAULT_GRAPH_SCOPES) {
+async function defaultGetAccessToken(scopes = DEFAULT_GRAPH_SCOPES) {
   const pca = await getPublicClientApplication();
   const accounts = await pca.getTokenCache().getAllAccounts();
   if (accounts.length > 0) {
@@ -299,6 +320,19 @@ async function getAccessToken(scopes = DEFAULT_GRAPH_SCOPES) {
   return result.accessToken;
 }
 
+function setAccessTokenProvider(provider) {
+  accessTokenProvider = provider;
+}
+
+function resetAccessTokenProvider() {
+  accessTokenProvider = null;
+}
+
+async function getAccessToken(scopes = DEFAULT_GRAPH_SCOPES) {
+  const provider = accessTokenProvider || defaultGetAccessToken;
+  return provider(scopes);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -318,15 +352,6 @@ function retryDelayMs(response, attempt) {
   return Math.min(DEFAULT_GRAPH_BASE_DELAY_MS * 2 ** attempt, DEFAULT_GRAPH_MAX_DELAY_MS);
 }
 
-async function throttleGraphRequest() {
-  const now = Date.now();
-  const elapsed = now - lastGraphRequestAt;
-  if (elapsed < DEFAULT_GRAPH_MIN_INTERVAL_MS) {
-    await sleep(DEFAULT_GRAPH_MIN_INTERVAL_MS - elapsed);
-  }
-  lastGraphRequestAt = Date.now();
-}
-
 async function graphFetch(
   initialToken,
   url,
@@ -334,9 +359,15 @@ async function graphFetch(
 ) {
   let token = initialToken;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    await throttleGraphRequest();
+    await acquireGraphRequestSlot();
     let response;
     try {
+      const now = Date.now();
+      const elapsed = now - lastGraphRequestAt;
+      if (elapsed < DEFAULT_GRAPH_MIN_INTERVAL_MS) {
+        await sleep(DEFAULT_GRAPH_MIN_INTERVAL_MS - elapsed);
+      }
+      lastGraphRequestAt = Date.now();
       response = await fetch(url, {
         signal: AbortSignal.timeout(timeoutMs),
         headers: {
@@ -352,6 +383,8 @@ async function graphFetch(
         continue;
       }
       throw error;
+    } finally {
+      releaseGraphRequestSlot();
     }
 
     if (response.ok) {
@@ -1072,9 +1105,29 @@ async function writeLocalManifest(rootDir, manifest) {
   });
 }
 
+function createManifestSyncState(overrides = {}) {
+  return {
+    status: "exported_html_only",
+    contentFetchedAt: null,
+    postprocessedAt: null,
+    lastSuccessfulSyncAt: null,
+    hasRemoteResources: null,
+    resourceFailureCount: 0,
+    resourceFailures: [],
+    markdownPresent: null,
+    htmlPresent: null,
+    jsonPresent: null,
+    assetDirPresent: null,
+    lastError: null,
+    ...overrides
+  };
+}
+
 async function updateManifestPage(rootDir, manifest, sectionPath, sectionDir, page) {
   const files = pageFileSet(sectionDir, page);
   const rel = (targetPath) => path.relative(rootDir, targetPath);
+  const previous = manifest.pages[page.id] || {};
+  const previousSyncState = previous.syncState || {};
   manifest.pages[page.id] = {
     id: page.id,
     title: page.title || page.id,
@@ -1086,8 +1139,122 @@ async function updateManifestPage(rootDir, manifest, sectionPath, sectionDir, pa
     markdownPath: rel(files.markdownPath),
     assetDir: rel(files.assetDir),
     webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || null,
-    exportedAt: nowIso()
+    exportedAt: nowIso(),
+    syncState: createManifestSyncState({
+      ...previousSyncState,
+      status: "exported_html_only",
+      contentFetchedAt: nowIso(),
+      htmlPresent: true,
+      jsonPresent: true,
+      markdownPresent: false,
+      assetDirPresent: previousSyncState.assetDirPresent ?? false,
+      lastError: null
+    })
   };
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter(Boolean).map((value) => String(value)))];
+}
+
+async function inspectManifestPageHealth(rootDir, manifestPage) {
+  const htmlPath = manifestPage.htmlPath ? path.join(rootDir, manifestPage.htmlPath) : null;
+  const jsonPath = manifestPage.jsonPath ? path.join(rootDir, manifestPage.jsonPath) : null;
+  const markdownPath = manifestPage.markdownPath ? path.join(rootDir, manifestPage.markdownPath) : null;
+  const assetDirPath = manifestPage.assetDir ? path.join(rootDir, manifestPage.assetDir) : null;
+  const htmlExists = htmlPath ? await pathExists(htmlPath) : false;
+  const jsonExists = jsonPath ? await pathExists(jsonPath) : false;
+  const markdownExists = markdownPath ? await pathExists(markdownPath) : false;
+  const assetDirExists = assetDirPath ? await pathExists(assetDirPath) : false;
+
+  let htmlHasRemoteResources = false;
+  let remoteResourceCount = 0;
+  if (htmlExists && htmlPath) {
+    const html = await fs.readFile(htmlPath, "utf8");
+    const references = extractResourceReferences(html);
+    remoteResourceCount = references.filter((ref) => isGraphOneNoteResourceUrl(ref.value)).length;
+    htmlHasRemoteResources = remoteResourceCount > 0;
+  }
+
+  const previousSyncState = manifestPage.syncState || {};
+  const resourceFailures = uniqueStrings([
+    ...(previousSyncState.resourceFailures || []),
+    ...(previousSyncState.failedResources || [])
+      .map((entry) => entry?.url || entry?.error)
+  ]);
+  const recordedFailureCount = Number(previousSyncState.resourceFailureCount || 0);
+  const effectiveFailureCount = Math.max(recordedFailureCount, resourceFailures.length);
+
+  const issues = [];
+  if (!htmlExists) issues.push("missing_html");
+  if (!jsonExists) issues.push("missing_json");
+  if (!markdownExists) issues.push("missing_markdown");
+  if (htmlHasRemoteResources) issues.push("remote_graph_resources");
+  if (effectiveFailureCount > 0) issues.push("resource_failures_recorded");
+  if (previousSyncState.status && previousSyncState.status !== "synced") {
+    issues.push(`status_${previousSyncState.status}`);
+  }
+
+  const healthy = issues.length === 0;
+  const syncState = createManifestSyncState({
+    ...previousSyncState,
+    status: healthy
+      ? "synced"
+      : htmlExists && jsonExists
+        ? "needs_repair"
+        : "missing_local_files",
+    hasRemoteResources: htmlExists ? htmlHasRemoteResources : previousSyncState.hasRemoteResources ?? null,
+    resourceFailureCount: effectiveFailureCount,
+    resourceFailures,
+    markdownPresent: markdownExists,
+    htmlPresent: htmlExists,
+    jsonPresent: jsonExists,
+    assetDirPresent: assetDirExists,
+    lastError: healthy ? null : uniqueStrings([previousSyncState.lastError, ...issues]).join(", ")
+  });
+
+  return {
+    healthy,
+    issues,
+    syncState,
+    htmlExists,
+    jsonExists,
+    markdownExists,
+    assetDirExists,
+    htmlHasRemoteResources,
+    remoteResourceCount
+  };
+}
+
+async function refreshManifestPageHealth(rootDir, manifest, pageId) {
+  const manifestPage = manifest.pages[pageId];
+  if (!manifestPage) {
+    return null;
+  }
+  const health = await inspectManifestPageHealth(rootDir, manifestPage);
+  manifestPage.syncState = health.syncState;
+  return health;
+}
+
+async function cleanupLocalPageFiles(rootDir, manifestPage) {
+  const paths = [
+    manifestPage.htmlPath,
+    manifestPage.jsonPath,
+    manifestPage.markdownPath,
+    manifestPage.assetDir
+  ].filter(Boolean);
+  for (const relPath of paths) {
+    const targetPath = path.join(rootDir, relPath);
+    if (!(await pathExists(targetPath))) {
+      continue;
+    }
+    const stat = await fs.stat(targetPath);
+    if (stat.isDirectory()) {
+      await fs.rm(targetPath, { recursive: true, force: true });
+    } else {
+      await fs.unlink(targetPath);
+    }
+  }
 }
 
 async function postprocessHtmlFile(token, htmlPath, turndownService, options = {}) {
@@ -1162,12 +1329,17 @@ async function postprocessHtmlFile(token, htmlPath, turndownService, options = {
   const markdown = createMarkdownFromOneNoteDocument(document) || turndownService.turndown(document.body.innerHTML);
   const markdownPath = `${htmlPath.slice(0, -".html".length)}.md`;
   await fs.writeFile(markdownPath, `${markdown.trim()}\n`);
+  const remainingRemoteResourceCount = extractResourceReferences(processedHtml)
+    .filter((ref) => isGraphOneNoteResourceUrl(ref.value))
+    .length;
 
   return {
     htmlPath,
     markdownPath,
     downloadedAssets: assetCounter,
-    failedResources
+    failedResources,
+    hasRemoteResources: remainingRemoteResourceCount > 0,
+    remainingRemoteResourceCount
   };
 }
 
@@ -1383,10 +1555,10 @@ async function graphPagesForSection(token, sectionId, options = {}) {
 }
 
 async function graphPagesForSectionRecent(token, sectionId, options = {}) {
-  // Fetch just the most recently modified page (default order is lastModifiedDateTime desc)
+  // Fetch the most recently modified pages explicitly ordered by lastModifiedDateTime.
   const items = await graphFetchAllJsonItems(
     token,
-    `${graphOneNoteRoot(options)}/sections/${sectionId}/pages?$top=1`
+    `${graphOneNoteRoot(options)}/sections/${sectionId}/pages?$top=1&$orderby=lastModifiedDateTime desc`
   );
   return items;
 }
@@ -1567,6 +1739,7 @@ async function buildLocalPagesManifest(options) {
       const files = pageFileSet(sectionDir, page);
       if ((await pathExists(files.htmlPath)) && (await pathExists(files.jsonPath))) {
         await updateManifestPage(rootDir, manifest, sectionPath, sectionDir, page);
+        await refreshManifestPageHealth(rootDir, manifest, page.id);
       }
     }
   }
@@ -1681,6 +1854,8 @@ async function writeDiffLogMarkdown(summary, rootDir) {
   lines.push(`| Local manifest pages | ${t.localManifestPages} |`);
   lines.push(`| Added | ${t.added} |`);
   lines.push(`| Updated | ${t.updated} |`);
+  lines.push(`| Repair needed | ${t.repairNeeded || 0} |`);
+  lines.push(`| Moved | ${t.moved || 0} |`);
   lines.push(`| Deleted | ${t.deleted} |`);
   lines.push(`| Missing local files | ${t.missingLocal} |`);
   lines.push(`| Unchanged | ${t.unchanged} |`);
@@ -1743,6 +1918,15 @@ async function writeDiffLogMarkdown(summary, rootDir) {
   pageTable("Updated Pages", summary.updated, [
     { header: "Previous Modified", value: p => p.previousLastModifiedDateTime?.slice(0, 19) || "-" },
     { header: "New Modified", value: p => p.lastModifiedDateTime?.slice(0, 19) || "-" }
+  ]);
+
+  pageTable("Repair Needed", summary.repairNeeded, [
+    { header: "Reasons", value: p => (p.repairReasons || []).join(", ") || "-" }
+  ]);
+
+  pageTable("Moved Pages", summary.moved, [
+    { header: "From", value: p => p.previousSectionPath || "-" },
+    { header: "To", value: p => p.sectionPath || "-" }
   ]);
 
   pageTable("Deleted Pages", summary.deleted, [
@@ -1820,6 +2004,8 @@ async function diffGraphNotebook(options) {
   const added = [];
   const updated = [];
   const missingLocal = [];
+  const repairNeeded = [];
+  const moved = [];
   const unchanged = [];
   const deleted = [];
 
@@ -1833,11 +2019,37 @@ async function diffGraphNotebook(options) {
       continue;
     }
 
+    const sectionMoved = localPage.sectionPath !== remotePage.sectionPath;
+    if (sectionMoved) {
+      if (verbose) console.log(`  MOVED: ${remotePage.title} from ${localPage.sectionPath} to ${remotePage.sectionPath}`);
+      moved.push({
+        ...remotePage,
+        previousSectionPath: localPage.sectionPath
+      });
+      continue;
+    }
+
     const localHtmlPath = path.join(rootDir, localPage.htmlPath || "");
     const localJsonPath = path.join(rootDir, localPage.jsonPath || "");
     if (!(await pathExists(localHtmlPath)) || !(await pathExists(localJsonPath))) {
       if (verbose) console.log(`  MISSING: ${remotePage.sectionPath}/${remotePage.title}`);
       missingLocal.push(remotePage);
+      continue;
+    }
+
+    const health = await refreshManifestPageHealth(rootDir, manifest, remotePage.id);
+    if (health && !health.healthy) {
+      if (verbose) {
+        console.log(
+          `  REPAIR: ${remotePage.sectionPath}/${remotePage.title} ` +
+          `(${health.issues.join(", ")})`
+        );
+      }
+      repairNeeded.push({
+        ...remotePage,
+        repairReasons: health.issues,
+        localSyncState: health.syncState.status
+      });
       continue;
     }
 
@@ -1914,6 +2126,8 @@ async function diffGraphNotebook(options) {
       localManifestPages: Object.keys(manifest.pages || {}).length,
       added: added.length,
       updated: updated.length,
+      repairNeeded: repairNeeded.length,
+      moved: moved.length,
       missingLocal: missingLocal.length,
       deleted: deleted.length,
       unchanged: unchanged.length,
@@ -1922,8 +2136,11 @@ async function diffGraphNotebook(options) {
     },
     added,
     updated,
+    repairNeeded,
+    moved,
     missingLocal,
     deleted,
+    unchanged,
     protectedSections: remote.protectedSections,
     failedSections: remote.failedSections
   };
@@ -1934,7 +2151,15 @@ async function diffGraphNotebook(options) {
   console.log(`Wrote diff summary to ${outPath}`);
   console.log(JSON.stringify(summary.totals, null, 2));
 
-  if (summary.totals.added === 0 && summary.totals.updated === 0 && summary.totals.deleted === 0 && summary.totals.missingLocal === 0) {
+  await writeLocalManifest(rootDir, manifest);
+
+  if (
+    summary.totals.added === 0 &&
+    summary.totals.updated === 0 &&
+    summary.totals.repairNeeded === 0 &&
+    summary.totals.deleted === 0 &&
+    summary.totals.missingLocal === 0
+  ) {
     console.log("");
     console.log("⚠️  No changes detected. Possible reasons:");
     console.log("   • OneNote changes haven't synced to Microsoft Graph yet (can take a few minutes)");
@@ -1959,6 +2184,7 @@ async function exportSinglePage(token, rootDir, manifest, remotePage, options = 
   await fs.writeFile(files.htmlPath, html);
   await writeJson(files.jsonPath, remotePage.page);
   await updateManifestPage(rootDir, manifest, remotePage.sectionPath, sectionDir, remotePage.page);
+  return files;
 }
 
 async function cleanupDeletedPages(rootDir, manifest, deletedPages) {
@@ -1972,6 +2198,7 @@ async function cleanupDeletedPages(rootDir, manifest, deletedPages) {
     if (page.assetDir) pathsToDelete.push(path.join(rootDir, page.assetDir));
 
     let anyDeleted = false;
+    const pageFailures = [];
     for (const p of pathsToDelete) {
       try {
         if (await pathExists(p)) {
@@ -1986,13 +2213,17 @@ async function cleanupDeletedPages(rootDir, manifest, deletedPages) {
         }
       } catch (err) {
         console.error(`Failed to delete ${p}: ${err.message}`);
-        failed.push({ path: p, error: err.message });
+        const failure = { path: p, error: err.message };
+        pageFailures.push(failure);
+        failed.push(failure);
       }
     }
 
-    if (anyDeleted || failed.length === 0) {
+    if (pageFailures.length === 0) {
       cleaned.push(page);
       delete manifest.pages[page.id];
+    } else if (anyDeleted) {
+      console.warn(`Partial cleanup for deleted page ${page.title || page.id}; keeping manifest entry for retry.`);
     }
   }
   return { cleaned, failed };
@@ -2018,6 +2249,8 @@ async function writeSessionLog(notebookName, rootDir, diff, exportStats, cleanup
   lines.push("|--------|-------|");
   lines.push(`| Added pages exported | ${exportStats.pagesExported} |`);
   lines.push(`| Export failures | ${exportStats.pagesFailed} |`);
+  lines.push(`| Pages repaired locally | ${exportStats.repairedLocally || 0} |`);
+  lines.push(`| Repair pages detected | ${diff.totals.repairNeeded || 0} |`);
   lines.push(`| Deleted pages detected | ${diff.totals.deleted} |`);
   lines.push(`| Deleted pages cleaned | ${cleanupResult.cleaned.length} |`);
   lines.push(`| Cleanup failures | ${cleanupResult.failed.length} |`);
@@ -2041,6 +2274,19 @@ async function writeSessionLog(notebookName, rootDir, diff, exportStats, cleanup
     lines.push("|-------|--------------|");
     for (const p of diff.updated) {
       lines.push(`| ${(p.title || "Untitled").replace(/\|/g, "\\|")} | ${(p.sectionPath || "-").replace(/\|/g, "\\|")} |`);
+    }
+    lines.push("");
+  }
+
+  if ((diff.repairNeeded || []).length > 0) {
+    lines.push(`## Repair Needed (${diff.repairNeeded.length})`);
+    lines.push("");
+    lines.push("| Title | Section Path | Reasons |");
+    lines.push("|-------|--------------|---------|");
+    for (const p of diff.repairNeeded) {
+      lines.push(
+        `| ${(p.title || "Untitled").replace(/\|/g, "\\|")} | ${(p.sectionPath || "-").replace(/\|/g, "\\|")} | ${((p.repairReasons || []).join(", ") || "-").replace(/\|/g, "\\|")} |`
+      );
     }
     lines.push("");
   }
@@ -2137,7 +2383,13 @@ async function resyncGraphNotebook(options) {
     diff = await diffGraphNotebook({ ...options, notebook: notebookName, root: rootDir });
   }
   const manifest = await loadLocalManifest(rootDir);
-  const toExport = [...diff.added, ...diff.updated, ...diff.missingLocal];
+  const toExport = [
+    ...(diff.added || []),
+    ...(diff.updated || []),
+    ...(diff.repairNeeded || []),
+    ...(diff.moved || []),
+    ...(diff.missingLocal || [])
+  ];
   const forceTitles = (options["force-titles"] || "")
     .split(",")
     .map((s) => s.trim().toLowerCase())
@@ -2160,12 +2412,77 @@ async function resyncGraphNotebook(options) {
     pagesExported: 0,
     pagesFailed: 0,
     failedPages: [],
+    repairedLocally: 0,
+    moved: diff.moved?.length || 0,
     deletedMarked: diff.deleted.length
   };
+  const turndownService = createTurndownService();
 
   for (const remotePage of toExport) {
     try {
-      await exportSinglePage(token, rootDir, manifest, remotePage, options);
+      const localPage = manifest.pages[remotePage.id];
+      const movedPage = localPage && localPage.sectionPath !== remotePage.sectionPath;
+      const oldManifestPage = movedPage ? { ...localPage } : null;
+      const repairReasons = new Set(remotePage.repairReasons || []);
+      const canRepairLocally =
+        repairReasons.size > 0 &&
+        !movedPage &&
+        !repairReasons.has("missing_html") &&
+        !repairReasons.has("missing_json");
+      let files;
+      if (canRepairLocally && localPage?.htmlPath) {
+        const htmlPath = path.join(rootDir, localPage.htmlPath);
+        const sectionDir = sectionDirFromPath(rootDir, remotePage.sectionPath);
+        files = {
+          ...pageFileSet(sectionDir, remotePage.page),
+          htmlPath,
+          jsonPath: path.join(rootDir, localPage.jsonPath),
+          markdownPath: path.join(rootDir, localPage.markdownPath),
+          assetDir: path.join(rootDir, localPage.assetDir)
+        };
+        console.log(
+          `Repair local page: ${remotePage.sectionPath} :: ${remotePage.title} ` +
+          `(${[...repairReasons].join(", ")})`
+        );
+        stats.repairedLocally += 1;
+      } else {
+        files = await exportSinglePage(token, rootDir, manifest, remotePage, options);
+      }
+      const postprocessResult = await postprocessHtmlFile(token, files.htmlPath, turndownService, {
+        skipAssets: options["skip-assets"] === true
+      });
+      const manifestPage = manifest.pages[remotePage.id];
+      if (manifestPage) {
+        manifestPage.syncState = createManifestSyncState({
+          ...(manifestPage.syncState || {}),
+          status: postprocessResult.failedResources.length > 0 || postprocessResult.hasRemoteResources
+            ? "postprocess_incomplete"
+            : "synced",
+          contentFetchedAt: manifestPage.syncState?.contentFetchedAt || nowIso(),
+          postprocessedAt: nowIso(),
+          lastSuccessfulSyncAt:
+            postprocessResult.failedResources.length > 0 || postprocessResult.hasRemoteResources ? null : nowIso(),
+          hasRemoteResources: postprocessResult.hasRemoteResources,
+          resourceFailureCount: postprocessResult.failedResources.length,
+          resourceFailures: postprocessResult.failedResources.map((item) => `${item.url} :: ${item.error}`),
+          markdownPresent: true,
+          htmlPresent: true,
+          jsonPresent: true,
+          assetDirPresent: await pathExists(files.assetDir),
+          lastError:
+            postprocessResult.failedResources.length > 0 || postprocessResult.hasRemoteResources
+              ? `postprocess incomplete (${postprocessResult.failedResources.length} failed resources, ${postprocessResult.remainingRemoteResourceCount} remote refs remain)`
+              : null
+        });
+      }
+
+      if (oldManifestPage) {
+        const newManifestPage = manifest.pages[remotePage.id];
+        if (newManifestPage.htmlPath !== oldManifestPage.htmlPath) {
+          await cleanupLocalPageFiles(rootDir, oldManifestPage);
+        }
+      }
+
       stats.pagesExported += 1;
     } catch (error) {
       stats.pagesFailed += 1;
@@ -2175,6 +2492,13 @@ async function resyncGraphNotebook(options) {
         sectionPath: remotePage.sectionPath,
         error: error.message
       });
+      if (manifest.pages[remotePage.id]) {
+        manifest.pages[remotePage.id].syncState = createManifestSyncState({
+          ...(manifest.pages[remotePage.id].syncState || {}),
+          status: "sync_failed",
+          lastError: error.message
+        });
+      }
       console.error(`Failed resync page ${remotePage.title}: ${error.message}`);
     }
   }
@@ -2202,6 +2526,7 @@ async function resyncGraphNotebook(options) {
   await writeJson(path.join(rootDir, "resync-summary.json"), resyncSummary);
   await writeSessionLog(notebookName, rootDir, diff, stats, cleanupResult);
   console.log(`Resync complete. Exported ${stats.pagesExported} pages, failed ${stats.pagesFailed}. Cleaned ${cleanupResult.cleaned.length} deleted pages.`);
+  return resyncSummary;
 }
 
 async function graphStatus(options) {
@@ -2209,6 +2534,8 @@ async function graphStatus(options) {
   const structure = await readJsonIfExists(path.join(rootDir, "structure.json"));
   const countSummary = await readJsonIfExists(path.join(rootDir, "count-summary.json"));
   const exportSummary = await readJsonIfExists(path.join(rootDir, "export-summary.json"));
+  const diffSummary = await readJsonIfExists(path.join(rootDir, "diff-summary.json"));
+  const resyncSummary = await readJsonIfExists(path.join(rootDir, "resync-summary.json"));
   const postprocessSummary = await readJsonIfExists(path.join(rootDir, "postprocess-summary.json"));
   const filesystemCounts = await getExportFilesystemCounts(rootDir);
   const resourceCounts = await getExportResourceCounts(rootDir);
@@ -2234,6 +2561,21 @@ async function graphStatus(options) {
     assetDirs: filesystemCounts.assetDirs,
     resources: resourceCounts,
     sectionSummaries: filesystemCounts.sectionSummaries,
+    diffMovedPages: diffSummary?.totals?.moved ?? null,
+    diff: {
+      generatedAt: diffSummary?.generatedAt ?? null,
+      isQuick: diffSummary?.isQuick ?? null,
+      totals: diffSummary?.totals ?? null
+    },
+    resync: {
+      generatedAt: resyncSummary?.generatedAt ?? null,
+      diffReused: resyncSummary?.diffReused ?? null,
+      pagesExported: resyncSummary?.stats?.pagesExported ?? null,
+      pagesFailed: resyncSummary?.stats?.pagesFailed ?? null,
+      movedPages: resyncSummary?.stats?.moved ?? null,
+      deletedDetected: resyncSummary?.cleanup?.deletedDetected ?? null,
+      deletedCleaned: resyncSummary?.cleanup?.deletedCleaned ?? null
+    },
     postprocessedHtmlFiles: postprocessSummary?.htmlFilesProcessed ?? null,
     downloadedAssets: postprocessSummary?.downloadedAssets ?? null
   };
@@ -2538,7 +2880,7 @@ async function exportGraphNotebook(options) {
   }
 
   for (const group of structure.sectionGroups || []) {
-    await exportGroupRecursive(token, group, pagesRoot, stats, [], { knownProtectedSectionPaths });
+    await exportGroupRecursive(token, group, pagesRoot, stats, [], { ...options, knownProtectedSectionPaths });
   }
 
   await writeJson(path.join(outDir, "export-summary.json"), {
@@ -2546,6 +2888,7 @@ async function exportGraphNotebook(options) {
     notebook: notebook.displayName,
     stats
   });
+  await buildLocalPagesManifest({ root: outDir });
   console.log(`Exported notebook "${notebookName}" HTML to ${outDir}`);
 }
 
@@ -2563,6 +2906,15 @@ async function postprocessGraphExport(options) {
   const token = await getAccessToken();
   console.log("Access token acquired");
   const turndownService = createTurndownService();
+  let manifest = await loadLocalManifest(rootDir);
+  if (!manifest.generatedAt) {
+    manifest = await buildLocalPagesManifest({ root: rootDir });
+  }
+  const pageIdByHtmlRelativePath = new Map(
+    Object.values(manifest.pages || {})
+      .filter((page) => page.htmlPath)
+      .map((page) => [page.htmlPath, page.id])
+  );
   let htmlFiles = await collectFiles(pagesDir, ".html");
   if (onlyReport) {
     const reportPath = options.report || path.join(rootDir, "quality-report.json");
@@ -2584,9 +2936,32 @@ async function postprocessGraphExport(options) {
     await activeTracker?.setCurrentPage(path.relative(rootDir, htmlFile));
     await activeTracker?.setPhase("postprocess-file");
     console.log(`Post-processing: ${path.relative(rootDir, htmlFile)}`);
-    results.push(await postprocessHtmlFile(token, htmlFile, turndownService, {
+    const result = await postprocessHtmlFile(token, htmlFile, turndownService, {
       skipAssets: options["skip-assets"] === true
-    }));
+    });
+    results.push(result);
+
+    const pageId = pageIdByHtmlRelativePath.get(path.relative(rootDir, htmlFile));
+    if (pageId && manifest.pages[pageId]) {
+      manifest.pages[pageId].syncState = createManifestSyncState({
+        ...(manifest.pages[pageId].syncState || {}),
+        status: result.failedResources.length > 0 || result.hasRemoteResources ? "postprocess_incomplete" : "synced",
+        postprocessedAt: nowIso(),
+        lastSuccessfulSyncAt:
+          result.failedResources.length > 0 || result.hasRemoteResources ? null : nowIso(),
+        hasRemoteResources: result.hasRemoteResources,
+        resourceFailureCount: result.failedResources.length,
+        resourceFailures: result.failedResources.map((item) => `${item.url} :: ${item.error}`),
+        markdownPresent: true,
+        htmlPresent: true,
+        jsonPresent: true,
+        assetDirPresent: await pathExists(`${htmlFile.slice(0, -".html".length)}.assets`),
+        lastError:
+          result.failedResources.length > 0 || result.hasRemoteResources
+            ? `postprocess incomplete (${result.failedResources.length} failed resources, ${result.remainingRemoteResourceCount} remote refs remain)`
+            : null
+      });
+    }
   }
 
   const summary = {
@@ -2599,15 +2974,35 @@ async function postprocessGraphExport(options) {
     results
   };
 
+  for (const pageId of Object.keys(manifest.pages || {})) {
+    await refreshManifestPageHealth(rootDir, manifest, pageId);
+  }
+
   await writeJson(path.join(rootDir, "postprocess-summary.json"), summary);
+  await writeLocalManifest(rootDir, manifest);
   console.log(`Post-processing complete. Summary written to ${path.join(rootDir, "postprocess-summary.json")}`);
 }
 
 async function graphSync(options) {
   const notebookName = options.notebook || "A";
   const outDir = options.out || path.join(process.cwd(), "exports", "graph", sanitizeSegment(notebookName));
-  await exportGraphNotebook({ ...options, notebook: notebookName, out: outDir });
-  await postprocessGraphExport({ root: outDir });
+  const manifestPath = path.join(outDir, "pages-manifest.json");
+  if (options["force-full"] === true || !(await pathExists(manifestPath))) {
+    console.log("No existing manifest or force-full requested; running full export and postprocess.");
+    await exportGraphNotebook({ ...options, notebook: notebookName, out: outDir });
+    await postprocessGraphExport({ root: outDir });
+    return;
+  }
+  console.log("Running incremental resync based on existing manifest.");
+  const summary = await resyncGraphNotebook({ ...options, notebook: notebookName, root: outDir });
+  if (summary) {
+    const moved = summary.stats?.moved || 0;
+    console.log(
+      `Incremental sync summary: exported ${summary.stats.pagesExported} pages, ` +
+      `repaired locally ${summary.stats.repairedLocally || 0}, ` +
+      `failed ${summary.stats.pagesFailed}, deleted cleaned ${summary.cleanup.deletedCleaned}, moved ${summary.stats.moved || 0}.`
+    );
+  }
 }
 
 function escapeHtml(str) {
@@ -3027,6 +3422,9 @@ export {
   writeLocalManifest,
   buildLocalPagesManifest,
   diffGraphNotebook,
+  graphStatus,
+  setAccessTokenProvider,
+  resetAccessTokenProvider,
   resyncGraphNotebook,
   cleanupDeletedPages,
   scanRemotePages,
