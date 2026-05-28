@@ -8,16 +8,21 @@ npm-shrinkwrap.json
 yarn.lock
 
 # Environment & secrets
+.env
 .env.local
 .env.*.local
 .env.development
 .env.production
+!.env.example
 *.pem
 *.key
 *.p12
 *.pfx
 *.cert
 *.crt
+*.token
+secrets/
+credentials.json
 
 # OS files
 .DS_Store
