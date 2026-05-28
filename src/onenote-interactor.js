@@ -124,6 +124,14 @@ async function loadLocalEnv() {
   await loadDotEnvFile(path.join(process.cwd(), ".env.local"));
 }
 
+// Resolve the export root: ONENOTE_SYNC_PATH env var overrides default `exports/` inside the project
+function resolveExportRoot(customPath) {
+  if (customPath) return path.resolve(customPath);
+  const envRoot = process.env.ONENOTE_SYNC_PATH;
+  if (envRoot) return path.resolve(envRoot);
+  return path.join(process.cwd(), "exports");
+}
+
 function truncateUtf8(value, maxBytes) {
   let result = "";
   let bytes = 0;
@@ -218,7 +226,7 @@ async function buildLocalIndex(options) {
 
   const tree = await scanTree(notebookPath);
   const outputPath =
-    options.out || path.join(process.cwd(), "exports", `local-index-${sanitizeSegment(notebookName)}.json`);
+    options.out || path.join(resolveExportRoot(), `local-index-${sanitizeSegment(notebookName)}.json`);
 
   await writeJson(outputPath, {
     generatedAt: new Date().toISOString(),
@@ -240,7 +248,7 @@ async function previewLocalFile(options) {
 
   const outputPath =
     options.out ||
-    path.join(process.cwd(), "exports", `${sanitizeSegment(path.basename(inputPath))}.strings.txt`);
+    path.join(resolveExportRoot(), `${sanitizeSegment(path.basename(inputPath))}.strings.txt`);
 
   const { stdout } = await execFile("strings", [inputPath], {
     maxBuffer: 50 * 1024 * 1024
@@ -1481,7 +1489,7 @@ async function exportDrivePackage(options) {
     throw new Error("Provide --drive-id and --item-id for graph-drive-export.");
   }
 
-  const outDir = options.out || path.join(process.cwd(), "exports", "drive", sanitizeSegment(itemId));
+  const outDir = options.out || path.join(resolveExportRoot(), "drive", sanitizeSegment(itemId));
   const token = await getAccessToken();
   await ensureDir(outDir);
   await activeTracker?.setPhase("drive-export-start");
@@ -1658,7 +1666,7 @@ function flattenStructureSections(structure) {
 
 async function countGraphNotebookPages(options) {
   const notebookName = options.notebook || "A";
-  const outPath = options.out || path.join(process.cwd(), "exports", "graph", sanitizeSegment(notebookName), "count-summary.json");
+  const outPath = options.out || path.join(resolveExportRoot(), "graph", sanitizeSegment(notebookName), "count-summary.json");
   const token = await getAccessToken();
   const notebook = await graphFindNotebook(token, notebookName, options);
   const structure = await buildGraphStructure(token, notebook, options);
@@ -1722,7 +1730,7 @@ function sectionDirFromPath(rootDir, sectionPath) {
 }
 
 async function buildLocalPagesManifest(options) {
-  const rootDir = options.root || path.join(process.cwd(), "exports", "graph", "A");
+  const rootDir = options.root || path.join(resolveExportRoot(), "graph", "A");
   const pagesRoot = path.join(rootDir, "pages");
   const sectionSummaries = await collectFiles(pagesRoot, "_section.json");
   const manifest = {
@@ -1968,7 +1976,7 @@ async function writeDiffLogMarkdown(summary, rootDir) {
 }
 
 async function diffGraphNotebook(options) {
-  const rootDir = options.root || options.out || path.join(process.cwd(), "exports", "graph", sanitizeSegment(options.notebook || "A"));
+  const rootDir = options.root || options.out || path.join(resolveExportRoot(), "graph", sanitizeSegment(options.notebook || "A"));
   const notebookJson = await readJsonIfExists(path.join(rootDir, "notebook.json"));
   const notebookName = options.notebook || notebookJson?.displayName || "A";
   const token = await getAccessToken();
@@ -2368,7 +2376,7 @@ async function loadExistingDiffSummary(rootDir, notebookName, maxAgeMs = 24 * 60
 
 async function resyncGraphNotebook(options) {
   const notebookName = options.notebook || "A";
-  const rootDir = options.root || options.out || path.join(process.cwd(), "exports", "graph", sanitizeSegment(notebookName));
+  const rootDir = options.root || options.out || path.join(resolveExportRoot(), "graph", sanitizeSegment(notebookName));
   const token = await getAccessToken();
 
   let diff;
@@ -2530,7 +2538,7 @@ async function resyncGraphNotebook(options) {
 }
 
 async function graphStatus(options) {
-  const rootDir = options.root || path.join(process.cwd(), "exports", "graph", "A");
+  const rootDir = options.root || path.join(resolveExportRoot(), "graph", "A");
   const structure = await readJsonIfExists(path.join(rootDir, "structure.json"));
   const countSummary = await readJsonIfExists(path.join(rootDir, "count-summary.json"));
   const exportSummary = await readJsonIfExists(path.join(rootDir, "export-summary.json"));
@@ -2610,7 +2618,7 @@ function readableTextFromMarkdown(markdown) {
 }
 
 async function auditGraphExport(options) {
-  const rootDir = options.root || path.join(process.cwd(), "exports", "graph", "A");
+  const rootDir = options.root || path.join(resolveExportRoot(), "graph", "A");
   const pagesDir = path.join(rootDir, "pages");
   const htmlFiles = await collectFiles(pagesDir, ".html");
   const findings = [];
@@ -2823,7 +2831,7 @@ async function exportGroupRecursive(token, group, targetDir, stats, groupPath = 
 
 async function exportGraphNotebook(options) {
   const notebookName = options.notebook || "A";
-  const outDir = options.out || path.join(process.cwd(), "exports", "graph", sanitizeSegment(notebookName));
+  const outDir = options.out || path.join(resolveExportRoot(), "graph", sanitizeSegment(notebookName));
   console.log(`Starting export for notebook: ${notebookName}`);
   const token = await getAccessToken();
   console.log("Access token acquired");
@@ -2893,7 +2901,7 @@ async function exportGraphNotebook(options) {
 }
 
 async function postprocessGraphExport(options) {
-  const rootDir = options.root || path.join(process.cwd(), "exports", "graph", "A");
+  const rootDir = options.root || path.join(resolveExportRoot(), "graph", "A");
   const pagesDir = path.join(rootDir, "pages");
   const force = options.force === true;
   const onlyReport = options["only-report"] === true;
@@ -2985,7 +2993,7 @@ async function postprocessGraphExport(options) {
 
 async function graphSync(options) {
   const notebookName = options.notebook || "A";
-  const outDir = options.out || path.join(process.cwd(), "exports", "graph", sanitizeSegment(notebookName));
+  const outDir = options.out || path.join(resolveExportRoot(), "graph", sanitizeSegment(notebookName));
   const manifestPath = path.join(outDir, "pages-manifest.json");
   if (options["force-full"] === true || !(await pathExists(manifestPath))) {
     console.log("No existing manifest or force-full requested; running full export and postprocess.");
@@ -3015,7 +3023,7 @@ function escapeHtml(str) {
 }
 
 async function generateHtmlViewer(options) {
-  const rootDir = options.root || path.join(process.cwd(), "exports", "graph", "A");
+  const rootDir = options.root || path.join(resolveExportRoot(), "graph", "A");
   const structure = await readJsonIfExists(path.join(rootDir, "structure.json"));
   const manifest = await loadLocalManifest(rootDir);
 
@@ -3305,12 +3313,12 @@ async function main() {
   if (["graph-count", "graph-export", "graph-postprocess", "graph-sync", "graph-diff", "graph-resync", "graph-drive-export"].includes(command)) {
     trackerRoot =
       command === "graph-postprocess" || command === "graph-diff" || command === "graph-resync"
-        ? (options.root || path.join(process.cwd(), "exports", "graph", "A"))
+        ? (options.root || path.join(resolveExportRoot(), "graph", "A"))
         : command === "graph-drive-export"
-          ? (options.out || path.join(process.cwd(), "exports", "drive", sanitizeSegment(options["item-id"] || "package")))
+          ? (options.out || path.join(resolveExportRoot(), "drive", sanitizeSegment(options["item-id"] || "package")))
         : command === "graph-count" && options.out
           ? path.dirname(options.out)
-          : (options.out || path.join(process.cwd(), "exports", "graph", sanitizeSegment(options.notebook || "A")));
+          : (options.out || path.join(resolveExportRoot(), "graph", sanitizeSegment(options.notebook || "A")));
     activeTracker = await createProgressTracker({
       command,
       rootDir: trackerRoot,
