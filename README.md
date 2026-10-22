@@ -47,6 +47,7 @@ pnpm run graph:diff
 pnpm run graph:resync
 pnpm run graph:postprocess
 pnpm run graph:status
+pnpm run graph:audit
 pnpm run graph:sync
 pnpm run stats:server
 pnpm run stats:server:silent
@@ -486,3 +487,7 @@ Good next OSS improvements:
 2. Add optional concurrency controls / throttle flags.
 3. Add a final export completeness report that compares API page totals to local files.
 4. Add tests around retry, resume, and protected-section handling.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
